@@ -1,0 +1,39 @@
+{
+  "realm": "wagering",
+  "enabled": true,
+  "accessTokenLifespan": 3600,
+  "clients": [
+    {
+      "clientId": "wagering-api",
+      "name": "Wagering API (resource server)",
+      "enabled": true,
+      "publicClient": false,
+      "bearerOnly": false,
+      "serviceAccountsEnabled": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false
+    },
+    {
+      "clientId": "provider-a",
+      "name": "Game Provider A (service account)",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "provider-a-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "audience-wagering-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "wagering-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

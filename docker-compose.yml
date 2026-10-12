@@ -1,0 +1,150 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports:
+      - '5442:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U wagering -d wagering']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  localstack:
+    image: localstack/localstack:3
+    environment:
+      SERVICES: sqs
+      DEBUG: 0
+    ports:
+      - '4566:4566'
+    healthcheck:
+      test: ['CMD-SHELL', 'awslocal sqs list-queues']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ['start-dev', '--import-realm']
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: 'true'
+      # Issuer estável (localhost) mesmo quando o token é pedido de dentro
+      # da rede Docker — o app valida o issuer e busca as chaves via
+      # KEYCLOAK_JWKS_URI na rede interna.
+      KC_HOSTNAME: localhost
+    ports:
+      - '8080:8080'
+    volumes:
+      - ./keycloak/wagering-realm.json:/opt/keycloak/data/import/wagering-realm.json:ro
+
+  queues-setup:
+    image: oven/bun:1
+    working_dir: /app
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./node_modules:/app/node_modules:ro
+      - ./package.json:/app/package.json:ro
+    environment:
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    command: ['bun', 'scripts/setup-queues.ts']
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  app:
+    build: .
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      WAGER_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      WAGER_DLQ_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
+      WAGER_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/wager-events.fifo
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/wagering
+      KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/wagering/protocol/openid-connect/certs
+      KEYCLOAK_AUDIENCE: wagering-api
+      AUTH_ENABLED: 'true'
+      RUN_MIGRATIONS: 'true'
+    ports:
+      - '3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      queues-setup:
+        condition: service_completed_successfully
+
+  # --- Observabilidade (profile opcional) --------------------------------
+  # `docker compose up -d`                              → só o essencial
+  # `docker compose --profile observability up -d`      → + dashboard
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: [observability]
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=6h'
+      - '--web.enable-lifecycle'
+    ports:
+      - '9090:9090'
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  loki:
+    image: grafana/loki:3.3.2
+    profiles: [observability]
+    command: ['-config.file=/etc/loki/loki.yml']
+    volumes:
+      - ./observability/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    profiles: [observability]
+    command: ['-config.file=/etc/promtail/promtail.yml']
+    volumes:
+      - ./observability/promtail.yml:/etc/promtail/promtail.yml:ro
+      # Descoberta de containers + leitura dos logs, ambos read-only.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    profiles: [observability]
+    # 3001 no host: 3000 fica livre para o `bun run start:dev`.
+    ports:
+      - '3001:3000'
+    environment:
+      # Stack local de demonstração — sem tela de login para apresentar.
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: 'true'
+      GF_USERS_DEFAULT_THEME: dark
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/wagering.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+
+volumes:
+  postgres-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:
