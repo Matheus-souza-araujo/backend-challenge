@@ -1,0 +1,837 @@
+{
+  "info": {
+    "name": "Distributed Wagering Processor",
+    "description": "Coleção completa da API do Distributed Wagering Processor (desafio Jungle Gaming).\n\n**Como usar:**\n\n1. Suba o ambiente: `docker compose up -d postgres localstack keycloak queues-setup` + `bun run migration:up` + `bun run start:dev`.\n2. Execute **Auth → Obter token (Keycloak)** — o token é salvo automaticamente na variável `{{token}}` e usado por todas as outras requisições.\n3. Execute **Wallets → Criar wallet** — o `walletId` é salvo automaticamente.\n4. Explore os cenários na ordem das pastas. As descrições de cada requisição explicam o que esperar.\n\n**Variáveis da coleção:** `baseUrl`, `keycloakUrl`, `token` (auto), `walletId` (auto), `transactionId` (auto), `playerId`, `extBet`.\n\n> Para criar uma transação NOVA depois de já ter rodado a coleção, mude o valor de `extBet` (a idempotency key deriva dele). Re-executar com o mesmo valor demonstra o replay idempotente — que é o comportamento correto, não um erro.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000"
+    },
+    {
+      "key": "keycloakUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "token",
+      "value": ""
+    },
+    {
+      "key": "walletId",
+      "value": ""
+    },
+    {
+      "key": "transactionId",
+      "value": ""
+    },
+    {
+      "key": "playerId",
+      "value": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1"
+    },
+    {
+      "key": "extBet",
+      "value": "postman-bet-1"
+    }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Obter token (Keycloak)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('token', body.access_token);",
+                  "pm.test('token salvo', () => pm.expect(body.access_token).to.be.a('string'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "client_credentials"
+                },
+                {
+                  "key": "client_id",
+                  "value": "provider-a"
+                },
+                {
+                  "key": "client_secret",
+                  "value": "provider-a-secret"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{keycloakUrl}}/realms/wagering/protocol/openid-connect/token",
+              "host": [
+                "{{keycloakUrl}}"
+              ],
+              "path": [
+                "realms",
+                "wagering",
+                "protocol",
+                "openid-connect",
+                "token"
+              ]
+            },
+            "description": "Login do provedor `provider-a` (service account / client credentials) no realm `wagering` do Keycloak.\n\nO script de teste salva o `access_token` na variável `{{token}}` — todas as outras requisições da coleção usam esse Bearer automaticamente.\n\n**Respostas:**\n- `200` — `{ access_token, expires_in: 3600, token_type: \"Bearer\", ... }`\n- `401 invalid_client` — client_id/secret errados.\n\nO token expira em **1 hora**: se qualquer requisição começar a responder 401 `Token inválido ou expirado`, rode esta requisição de novo."
+          }
+        }
+      ],
+      "description": "Autenticação via Keycloak (OIDC). Todos os endpoints da API — exceto health e metrics — exigem `Authorization: Bearer <token>`.\n\nSem token → `401 {\"message\":\"Token Bearer ausente\"}`. Token inválido/expirado → `401 {\"message\":\"Token inválido ou expirado\"}`."
+    },
+    {
+      "name": "Wallets",
+      "item": [
+        {
+          "name": "Criar wallet",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  pm.collectionVariables.set('walletId', pm.response.json().id);",
+                  "}",
+                  "pm.test('201 criada ou 409 duplicada', () => pm.expect([201, 409]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"playerId\": \"{{playerId}}\",\n  \"initialBalance\": { \"amount\": \"100.00\", \"currency\": \"BRL\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wallets",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wallets"
+              ]
+            },
+            "description": "Cria a wallet do player. O saldo inicial, quando positivo, gera a transação interna `OPENING` com o crédito correspondente no ledger — **na mesma transação SQL**.\n\nO script salva o `id` retornado em `{{walletId}}`.\n\n**Respostas:**\n- `201` — `{ id, playerId, balance: {amount: \"100.00\", currency: \"BRL\"}, version: 1 }`. Note `version: 1` já com o saldo aplicado.\n- `400` — payload inválido (playerId não-UUID, amount sem 2 casas decimais, amount numérico em vez de string, moeda fora do ISO-4217).\n- `401` — sem token.\n- `409 WalletAlreadyExistsError` — já existe wallet para `(playerId, currency)`. Para criar outra, mude a variável `playerId`."
+          }
+        },
+        {
+          "name": "Consultar wallet",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/wallets/{{walletId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wallets",
+                "{{walletId}}"
+              ]
+            },
+            "description": "Estado atual da wallet: saldo materializado e `version` (incrementa a cada mudança de saldo).\n\n**Respostas:**\n- `200` — `{ id, playerId, balance, version, createdAt, updatedAt }`\n- `400` — walletId não é UUID.\n- `401` — sem token.\n- `404 WalletNotFoundError` — wallet inexistente."
+          }
+        },
+        {
+          "name": "Extrato do ledger (paginado)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/wallets/{{walletId}}/ledger?limit=10",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wallets",
+                "{{walletId}}",
+                "ledger"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "10",
+                  "description": "1–200, default 50"
+                },
+                {
+                  "key": "cursor",
+                  "value": "",
+                  "description": "cursor opaco vindo de nextCursor da página anterior",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Lançamentos do ledger da wallet, do mais recente para o mais antigo, com **cursor opaco e estável** (não use offset).\n\nCada lançamento tem `direction` (DEBIT/CREDIT), `money`, `balanceBefore` e `balanceAfter` — os saldos são **encadeados**: o `balanceAfter` de um lançamento é o `balanceBefore` do seguinte.\n\nImportante: transações `LOSS` e `REJECTED` **não aparecem** — não geram lançamento.\n\n**Respostas:**\n- `200` — `{ entries: [...], nextCursor?: \"<base64url>\" }`. `nextCursor` ausente = última página.\n- `400 InvalidCursorError` — cursor corrompido/adulterado.\n- `401` — sem token. `404` — wallet inexistente."
+          }
+        },
+        {
+          "name": "Reconciliação",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('consistente', () => {",
+                  "  pm.expect(pm.response.code).to.eql(200);",
+                  "  pm.expect(pm.response.json().consistent).to.be.true;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/wallets/{{walletId}}/reconciliation",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wallets",
+                "{{walletId}}",
+                "reconciliation"
+              ]
+            },
+            "description": "Recalcula o saldo pelo ledger (SUM de créditos − débitos, em SQL, sob lock da wallet) e compara com o saldo materializado. **Divergências nunca são corrigidas silenciosamente** — são logadas, contadas em métrica e sinalizadas na resposta.\n\nEste é o teste-mãe do sistema: rode depois de qualquer sequência de operações.\n\n**Respostas:**\n- `200` — `{ walletId, storedBalance, calculatedBalance, difference, consistent, checkedEntries }`. Esperado **sempre**: `consistent: true` e `difference.amount: \"0.00\"`. Se vier `false`, há bug de consistência — o script de teste desta requisição falha nesse caso.\n- `401` — sem token. `404` — wallet inexistente."
+          }
+        }
+      ],
+      "description": "Criação e consulta de wallets, extrato do ledger imutável e reconciliação saldo × ledger."
+    },
+    {
+      "name": "Wagering — fluxo feliz",
+      "item": [
+        {
+          "name": "Submeter BET",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  pm.collectionVariables.set('transactionId', pm.response.json().transactionId);",
+                  "}",
+                  "pm.test('200 PROCESSED', () => {",
+                  "  pm.expect(pm.response.code).to.eql(200);",
+                  "  pm.expect(pm.response.json().status).to.eql('PROCESSED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}",
+                "description": "Obrigatório. Default recomendado: {providerId}:{externalTransactionId}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-1\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"BET\",\n  \"money\": { \"amount\": \"30.00\", \"currency\": \"BRL\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Aposta que debita a wallet. O header `Idempotency-Key` é obrigatório e é a **fonte da verdade** da deduplicação.\n\nO script salva o `transactionId` em `{{transactionId}}`.\n\n**Respostas:**\n- `200` — `{ transactionId, status: \"PROCESSED\", balance: {amount: \"70.00\", ...}, idempotentReplay: false }` — saldo debitado exatamente uma vez, um lançamento DEBIT no ledger.\n- `200` com `idempotentReplay: true` — você reenviou a MESMA requisição (mesma key + payload): a resposta é a **original**, com o saldo observado naquele momento. O saldo NÃO cai de novo. Envie quantas vezes quiser.\n- `400` — payload inválido ou header `Idempotency-Key` ausente.\n- `401` — sem token.\n- `404 WalletNotFoundError` — walletId inexistente.\n- `409 IDEMPOTENCY_CONFLICT` — mesma key com payload DIFERENTE (ver pasta de cenários de erro).\n- `422 REJECTED` — regra de negócio: `INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `WALLET_OWNERSHIP_MISMATCH`...\n- `503` + `Retry-After` — infraestrutura transitória fora do ar; seguro reenviar com a mesma key.\n\n> Re-executar esta requisição demonstra o replay. Para uma aposta NOVA, mude a variável `extBet`."
+          }
+        },
+        {
+          "name": "Submeter WIN (referenciando a BET)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-win"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-win\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-1\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"WIN\",\n  \"money\": { \"amount\": \"45.00\", \"currency\": \"BRL\" },\n  \"referenceExternalTransactionId\": \"{{extBet}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Prêmio creditado na wallet. A referência à BET é **opcional** para WIN (só pode referenciar BET), e o valor pode ser diferente do da aposta.\n\nA referência deve pertencer ao mesmo provider, player, wallet, moeda e **rodada** (`roundId`).\n\n**Respostas:**\n- `200 PROCESSED` — saldo creditado (+45.00), um lançamento CREDIT.\n- `202 PENDING_REFERENCE` — a BET referenciada ainda não chegou; o worker resolve quando ela chegar.\n- `422 REFERENCE_MISMATCH` — referência de outro player/wallet/rodada/moeda.\n- `422 INVALID_REFERENCE_KIND` — referência que não é BET.\n- Demais códigos: iguais aos de Submeter BET."
+          }
+        },
+        {
+          "name": "Submeter LOSS",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-loss"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-loss\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-2\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"LOSS\",\n  \"money\": { \"amount\": \"10.00\", \"currency\": \"BRL\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Registra o resultado da rodada **sem mover saldo**: não gera débito, crédito nem lançamento no ledger (confira no extrato). Não aceita referência.\n\n**Respostas:**\n- `200 PROCESSED` — `balance` na resposta é o saldo atual, **inalterado**.\n- Demais códigos: iguais aos de Submeter BET."
+          }
+        },
+        {
+          "name": "Submeter REFUND (reverte a BET)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-refund"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-refund\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-1\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"REFUND\",\n  \"money\": { \"amount\": \"30.00\", \"currency\": \"BRL\" },\n  \"referenceExternalTransactionId\": \"{{extBet}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Estorna uma BET `PROCESSED`, **uma única vez**, com valor **igual** ao da aposta (reversão parcial não existe). Referência obrigatória, só pode apontar para BET.\n\n**Respostas:**\n- `200 PROCESSED` — crédito de volta (+30.00).\n- `202 PENDING_REFERENCE` — BET ainda não chegou (fora de ordem).\n- `400` — sem `referenceExternalTransactionId`.\n- `422 REFERENCE_ALREADY_REVERSED` — segunda tentativa de REFUND sobre a mesma BET (rode duas vezes com keys diferentes para ver — há requisição pronta na pasta de erros).\n- `422 AMOUNT_MISMATCH` — valor diferente do da BET.\n- `422 REFERENCE_NOT_PROCESSED` — a BET referenciada terminou REJECTED/FAILED.\n- `422 REVERSAL_WOULD_OVERDRAW` — o estorno negativaria o saldo (código distinto de INSUFFICIENT_FUNDS de propósito)."
+          }
+        },
+        {
+          "name": "Submeter ROLLBACK",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-rb"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-rb\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-1\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"ROLLBACK\",\n  \"money\": { \"amount\": \"45.00\", \"currency\": \"BRL\" },\n  \"referenceExternalTransactionId\": \"{{extBet}}-win\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Reverte uma transação `PROCESSED` (BET, WIN ou REFUND) aplicando o **efeito inverso** da referência: rollback de BET credita; rollback de WIN ou REFUND **debita**. Valor deve ser igual ao da referência; uma única vez por (referência, kind).\n\nEste exemplo reverte o WIN da rodada (debita 45.00).\n\n**Respostas:** iguais às do REFUND, com a diferença de que `ROLLBACK` pode referenciar BET, WIN ou REFUND. Se o débito da reversão negativar o saldo → `422 REVERSAL_WOULD_OVERDRAW`, auditável."
+          }
+        },
+        {
+          "name": "Consultar transação por ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions/{{transactionId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions",
+                "{{transactionId}}"
+              ]
+            },
+            "description": "Consulta pelo **id interno** (UUID retornado no submit). Útil para acompanhar uma transação `PENDING_REFERENCE` até o worker resolvê-la.\n\n**Respostas:**\n- `200` — `{ transactionId, providerId, externalTransactionId, walletId, playerId, roundId, gameId, kind, money, status, failureCode?, referenceTransactionId?, balance?, createdAt, processedAt? }`\n- `400` — id não é UUID. `401` — sem token. `404 TransactionNotFoundError`."
+          }
+        },
+        {
+          "name": "Consultar transação por provider + externalId",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/providers/provider-a/wagering/transactions/{{extBet}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "providers",
+                "provider-a",
+                "wagering",
+                "transactions",
+                "{{extBet}}"
+              ]
+            },
+            "description": "Consulta pela **identidade externa** `(providerId, externalTransactionId)` — a visão que o provedor tem da transação, sem precisar guardar o UUID interno.\n\n**Respostas:** mesmas da consulta por ID (`200` / `401` / `404`)."
+          }
+        }
+      ],
+      "description": "Ciclo de vida completo de uma rodada: BET → WIN | LOSS → REFUND | ROLLBACK, mais as consultas. Execute na ordem."
+    },
+    {
+      "name": "Wagering — cenários de erro e idempotência",
+      "item": [
+        {
+          "name": "Replay exato (idempotentReplay: true)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('replay da resposta original', () => {",
+                  "  pm.expect(pm.response.code).to.eql(200);",
+                  "  pm.expect(pm.response.json().idempotentReplay).to.be.true;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-1\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"BET\",\n  \"money\": { \"amount\": \"30.00\", \"currency\": \"BRL\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Cópia exata do **Submeter BET** (mesma key, mesmo payload) — simula o provedor reenviando por timeout/retry (entrega at-least-once).\n\n**Esperado: `200`** com a resposta ORIGINAL — mesmo `transactionId`, mesmo `balance` observado na época — e `idempotentReplay: true`. O saldo **não** é debitado de novo: confira em Wallets → Consultar wallet.\n\nSe a original tivesse sido `REJECTED`, o replay devolveria o mesmo `422` com `idempotentReplay: true` — replay preserva o status HTTP original.\n\nPré-requisito: ter executado **Submeter BET** antes."
+          }
+        },
+        {
+          "name": "Mesma key, payload diferente → 409",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 conflito', () => {",
+                  "  pm.expect(pm.response.code).to.eql(409);",
+                  "  pm.expect(pm.response.json().failureCode).to.eql('IDEMPOTENCY_CONFLICT');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-1\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"BET\",\n  \"money\": { \"amount\": \"35.00\", \"currency\": \"BRL\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Mesma `Idempotency-Key` da BET original, mas com **valor diferente** (35.00 em vez de 30.00). Isso NÃO é replay — é conflito de contrato.\n\n**Esperado: `409`**\n```json\n{ \"statusCode\": 409, \"error\": \"IdempotencyConflictError\", \"failureCode\": \"IDEMPOTENCY_CONFLICT\", \"message\": \"...\" }\n```\nNada é persistido; o provedor deve corrigir o payload ou usar outra key.\n\nA comparação é por hash SHA-256 de um JSON canônico dos campos de negócio — qualquer campo alterado dispara o conflito."
+          }
+        },
+        {
+          "name": "Saldo insuficiente → 422",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422 INSUFFICIENT_FUNDS', () => {",
+                  "  pm.expect(pm.response.code).to.eql(422);",
+                  "  pm.expect(pm.response.json().failureCode).to.eql('INSUFFICIENT_FUNDS');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-broke"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-broke\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-3\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"BET\",\n  \"money\": { \"amount\": \"999999.00\", \"currency\": \"BRL\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Aposta maior que o saldo.\n\n**Esperado: `422`**\n```json\n{ \"transactionId\": \"<uuid>\", \"status\": \"REJECTED\", \"failureCode\": \"INSUFFICIENT_FUNDS\", \"balance\": {...saldo atual...}, \"idempotentReplay\": false }\n```\nA rejeição é **persistida e auditável** (consultável depois pelas rotas GET) e gera o evento `WagerTransactionRejected`. Saldo e ledger ficam intocados. O saldo nunca fica negativo — garantido também por CHECK no banco."
+          }
+        },
+        {
+          "name": "REFUND repetido → 422 REFERENCE_ALREADY_REVERSED",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-refund2"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-refund2\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-1\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"REFUND\",\n  \"money\": { \"amount\": \"30.00\", \"currency\": \"BRL\" },\n  \"referenceExternalTransactionId\": \"{{extBet}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Segundo REFUND sobre a mesma BET (key nova, então não é replay).\n\n**Esperado: `422`** com `failureCode: \"REFERENCE_ALREADY_REVERSED\"` — uma referência não pode ser revertida duas vezes pelo mesmo tipo de operação. Sob corrida entre instâncias, quem garante é o índice único parcial no banco.\n\nPré-requisito: ter executado **Submeter REFUND** antes."
+          }
+        },
+        {
+          "name": "ROLLBACK antes da referência → 202 PENDING_REFERENCE",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 aguardando referência', () => {",
+                  "  pm.expect(pm.response.code).to.eql(202);",
+                  "  pm.expect(pm.response.json().status).to.eql('PENDING_REFERENCE');",
+                  "});",
+                  "pm.collectionVariables.set('transactionId', pm.response.json().transactionId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-ooo-rb"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-ooo-rb\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-9\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"ROLLBACK\",\n  \"money\": { \"amount\": \"25.00\", \"currency\": \"BRL\" },\n  \"referenceExternalTransactionId\": \"{{extBet}}-ooo-bet\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Entrega **fora de ordem**: o ROLLBACK referencia uma BET que ainda não existe (`...-ooo-bet`).\n\n**Esperado: `202`**\n```json\n{ \"transactionId\": \"<uuid>\", \"status\": \"PENDING_REFERENCE\", \"idempotentReplay\": false }\n```\nO id fica salvo em `{{transactionId}}`. Fluxo completo:\n1. Execute esta requisição → 202.\n2. Execute **BET fora de ordem (chega depois)** → 200.\n3. Aguarde ~2–10 s (worker com backoff) e consulte **Consultar transação por ID** → o ROLLBACK estará `PROCESSED` com o crédito aplicado.\n\nSe a BET nunca chegar: após 8 tentativas (~15 min) → `REJECTED` com `failureCode: REFERENCE_NOT_FOUND`."
+          }
+        },
+        {
+          "name": "BET fora de ordem (chega depois)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-ooo-bet"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-ooo-bet\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-9\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"BET\",\n  \"money\": { \"amount\": \"25.00\", \"currency\": \"BRL\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "A BET referenciada pelo ROLLBACK pendente, chegando atrasada.\n\n**Esperado: `200 PROCESSED`** (débito de 25.00). Em seguida o worker de referências pendentes detecta que a referência do ROLLBACK agora existe e o aplica sozinho — o crédito de 25.00 volta. Saldo líquido da rodada: zero.\n\nAcompanhe com **Consultar transação por ID** (o `transactionId` do ROLLBACK ficou salvo) até ver `\"status\": \"PROCESSED\"`."
+          }
+        },
+        {
+          "name": "Moeda diferente da wallet → 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-usd"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-usd\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-4\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"BET\",\n  \"money\": { \"amount\": \"10.00\", \"currency\": \"USD\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "Aposta em USD contra uma wallet BRL.\n\n**Esperado: `422`** com `failureCode: \"CURRENCY_MISMATCH\"` — rejeição de negócio auditável (o modelo é multi-moeda; a wallet é que tem moeda fixa). Note que a resposta **omite** `balance` neste caso: o saldo está em outra moeda que a da transação."
+          }
+        },
+        {
+          "name": "Payload inválido (amount numérico) → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "provider-a:{{extBet}}-bad"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"providerId\": \"provider-a\",\n  \"externalTransactionId\": \"{{extBet}}-bad\",\n  \"playerId\": \"{{playerId}}\",\n  \"walletId\": \"{{walletId}}\",\n  \"roundId\": \"round-5\",\n  \"gameId\": \"fortune-chimp\",\n  \"kind\": \"BET\",\n  \"money\": { \"amount\": 25, \"currency\": \"BRL\" }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/wagering/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "wagering",
+                "transactions"
+              ]
+            },
+            "description": "`amount` como **número** em vez de string decimal — proibido: dinheiro nunca trafega como number.\n\n**Esperado: `400`** com mensagem de validação (`amount deve ser string decimal não-negativa com 2 casas`). Outras entradas rejeitadas na borda: `\"25\"` (sem casas), `\"25.5\"` (1 casa), `\"25.005\"` (3 casas), negativo, notação científica, `kind: \"OPENING\"` (interno), walletId não-UUID.\n\nNada é persistido em erros 400."
+          }
+        }
+      ],
+      "description": "Cenários que provam as garantias do sistema: replay idempotente, conflito de payload, rejeições de negócio auditáveis com failureCode estável e entrega fora de ordem."
+    },
+    {
+      "name": "Health & Metrics (sem auth)",
+      "item": [
+        {
+          "name": "Liveness",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/live",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "live"
+              ]
+            },
+            "description": "O processo está vivo? Não toca em dependências externas. Usa `@nestjs/terminus`.\n\n**Respostas:**\n- `200` — `{ \"status\": \"ok\", \"info\": {}, \"error\": {}, \"details\": {} }`\n- Sem resposta/conexão recusada — a aplicação não está rodando."
+          }
+        },
+        {
+          "name": "Readiness",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health/ready",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health",
+                "ready"
+              ]
+            },
+            "description": "Pronta para receber tráfego? Verifica PostgreSQL e SQS de verdade, via indicators do `@nestjs/terminus`.\n\n**Respostas:**\n- `200` — `{ \"status\": \"ok\", \"info\": { \"postgres\": { \"status\": \"up\" }, \"sqs\": { \"status\": \"up\" } }, \"error\": {}, \"details\": { ... } }`\n- `503` — `{ \"status\": \"error\", \"error\": { \"postgres\": { \"status\": \"down\", \"message\": \"...\" } }, ... }` (derrube o container do postgres e teste)."
+          }
+        },
+        {
+          "name": "Métricas Prometheus",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/metrics",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "metrics"
+              ]
+            },
+            "description": "Exposição Prometheus (text/plain). Principais séries:\n\n- `wager_transactions_total{status,kind,channel}` — transações por desfecho\n- `wager_idempotent_replays_total{channel}` — duplicatas detectadas\n- `wager_race_retries_total{constraint}` — corridas perdidas entre instâncias\n- `wager_processing_duration_seconds` — latência (histograma)\n- `sqs_consumer_messages_total{outcome}` — consumo da fila por desfecho\n- `outbox_published_total` / `outbox_retries_total` / `outbox_lag_seconds`\n- `pending_reference_resolutions_total{outcome}`\n- `sqs_dlq_depth` — mensagens na DLQ\n- `reconciliation_divergences_total` — deve ficar em 0 para sempre\n\n**Resposta:** `200` em formato de exposição Prometheus."
+          }
+        }
+      ],
+      "description": "Endpoints abertos (sem autenticação, por exigência do desafio): liveness, readiness e métricas."
+    }
+  ]
+}
