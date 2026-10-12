@@ -1,0 +1,14 @@
+{
+  // Usa o TypeScript do projeto (5.9), e não o embutido no editor — os aliases
+  // de `paths` e o moduleResolution "bundler" dependem de TS >= 5.
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "typescript.enablePromptUseWorkspaceTsdk": true,
+
+  // ESLint 9 usa flat config (eslint.config.mjs).
+  "eslint.useFlatConfig": true,
+  "eslint.validate": ["typescript"],
+
+  // Imports novos devem sair como alias (@domain/..., @app/...), não relativos.
+  "typescript.preferences.importModuleSpecifier": "non-relative",
+  "typescript.preferences.autoImportFileExcludePatterns": ["**/dist/**"]
+}
